@@ -1,0 +1,1889 @@
+"""D2A Mods: a small mod manager for Dota 2 by HowDota.
+
+Kinds of mods:
+  * our own rules from the site catalog ("replace these game files with an empty effect or silence"),
+    built on the player's PC from the game's own files (or a blank from Minify) into one VPK;
+  * file mods from the catalog (Minify's dark terrain): files from a pinned GitHub commit, each checked by its git hash;
+  * ready mods from the open Dota2PornFx (D2PFX) catalog, downloaded only when ticked, checked by SHA-256
+    and copied as they are.
+Everything goes into the folder of the game's voice language (e.g. game/dota_russian, or dota_<x> when Dota's
+launch options have -language <x>) as pakNN_dir.vpk, the way the D2PFX guide installs mods, so game updates don't switch them off.
+Fonts and English texts are the exception: Dota reads fonts straight from game/dota/panorama/fonts and some texts from
+game/core, so those files are replaced in place after copying the originals to our backup; uninstall puts them back.
+English interface: with -language dutch (how D2PFX runs mods on an English client) the game's *_english texts go
+into our VPK under *_dutch names, so the folder works and the text stays English. With an English client the files
+go to game/dota_d2a, mounted by one line in gameinfo.gi (backed up first). Uninstall removes only our files.
+
+Usage:  D2AMods.exe                                  window
+        d2mods.py --build-only out.vpk --mods a,b    build our rules VPK somewhere else, touch nothing in the game
+"""
+import base64
+import colorsys
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+import zipfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+
+import vpk
+
+APP_VERSION = "1.9.1"
+SITE = "https://howdota.com/"
+CATALOG_URL = SITE + "mods/catalog.json"
+D2PFX_SITE = "https://h6rd.github.io/Dota2PornFxWeb"
+D2PFX_CREDITS = "https://github.com/h6rd/Dota2PornFxWeb#credits"
+D2PFX_RAW = "https://raw.githubusercontent.com/h6rd/Dota2PornFxWeb/main/assets/"
+# only categories that neither unlock paid Valve cosmetics nor give an in-game advantage
+D2PFX_CATS = [("shaders", "Шейдеры тумана", "Fog shaders"), ("cursors", "Курсоры", "Cursors"), ("backgrounds", "Фоны меню", "Menu backgrounds"),
+              ("hero-icons", "Иконки героев", "Hero icons"), ("item-icons", "Иконки предметов", "Item icons"), ("ranks", "Иконки рангов", "Rank icons"),
+              ("pings", "Пинги", "Pings"), ("creep-deny", "Денай", "Deny"), ("terrains", "Ландшафты", "Terrains"), ("fonts", "Шрифты", "Fonts"),
+              ("huds", "Интерфейс", "HUD"), ("parts", "Части интерфейса", "HUD parts")]
+# paid Valve terrains, and terrain packs that also swap trees (tree shapes matter for vision)
+D2PFX_SKIP = re.compile(r"^(TI\d+\b|Dota\+|Crownfall|The Kings New Journey)|\btrees?\b", re.I)
+SINGLE_CATS = {"shaders", "terrains", "fonts", "creep-deny", "huds"}
+ENGLISH_ID = "english-ui"  # mods of these categories replace the same files, so one at a time
+MOD_FOLDER = "dota_d2a"  # English clients only
+MARK = "// D2A mods"
+PAK_FIRST = 60
+GAME_DIRS = ("particles", "materials", "models", "panorama", "resource", "sounds", "soundevents", "scripts", "maps")
+DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "D2AMods")
+UA = {"User-Agent": f"D2AMods/{APP_VERSION}"}
+LANG = "ru"  # set in main(): the player's choice, otherwise the Windows display language
+
+
+def T(ru, en):
+    return en if LANG == "en" else ru
+
+
+def loc(d):
+    """A {"ru": ..., "en": ...} text from the catalog in the app language."""
+    return (d or {}).get(LANG) or (d or {}).get("ru") or ""
+
+
+def system_lang():
+    try:
+        import ctypes
+        return "ru" if (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) in (0x19, 0x22, 0x23, 0x3F) else "en"  # ru, uk, be, kk
+    except Exception:
+        return "ru"
+
+
+def site_url(page):
+    return SITE + ("?lang=en" if LANG == "en" else "") + page
+
+
+def ver(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "0"))
+
+
+# ---------- game ----------
+
+def steam_roots():
+    roots = []
+    try:
+        import winreg
+        for hive, key in ((winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"), (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam")):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    for name in ("SteamPath", "InstallPath"):
+                        try:
+                            roots.append(winreg.QueryValueEx(k, name)[0])
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    roots += [r"C:\Program Files (x86)\Steam", r"C:\Program Files\Steam", os.path.expanduser("~/.steam/steam")]
+    return list({os.path.normcase(os.path.normpath(r)): os.path.normpath(r) for r in roots if os.path.isdir(r)}.values())
+
+
+def steam_libraries():
+    libs = []
+    for r in steam_roots():
+        vdf = os.path.join(r, "steamapps", "libraryfolders.vdf")
+        if os.path.exists(vdf):
+            with open(vdf, encoding="utf-8", errors="ignore") as f:
+                libs += [p.replace("\\\\", "\\") for p in re.findall(r'"path"\s+"([^"]+)"', f.read())]
+        libs.append(r)
+    return list(dict.fromkeys(os.path.normpath(p) for p in libs))
+
+
+def find_dota():
+    for lib in steam_libraries():
+        game = os.path.join(lib, "steamapps", "common", "dota 2 beta", "game")
+        if os.path.exists(os.path.join(game, "dota", "gameinfo.gi")):
+            return game
+    return None
+
+
+def game_language(game):
+    acf = os.path.join(game, "..", "..", "..", "appmanifest_570.acf")
+    try:
+        with open(acf, encoding="utf-8", errors="ignore") as f:
+            m = re.search(r'"language"\s+"(\w+)"', f.read())
+        return m.group(1).lower() if m else "english"
+    except OSError:
+        return "english"
+
+
+def parse_vdf(text):
+    """Steam's KeyValues text as nested dicts (enough for localconfig.vdf)."""
+    root, stack, key = {}, [], None
+    cur = root
+    for s, brace in re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text):
+        if brace == "{":
+            stack.append(cur)
+            cur[key] = cur = {}
+            key = None
+        elif brace == "}":
+            cur = stack.pop() if stack else root
+        elif key is None:
+            key = s
+        else:
+            cur[key] = s
+            key = None
+    return root
+
+
+def find_dota_app(d):
+    for k, v in d.items():
+        if isinstance(v, dict):
+            if k.lower() == "apps" and isinstance(v.get("570"), dict):
+                return v["570"]
+            found = find_dota_app(v)
+            if found:
+                return found
+    return None
+
+
+def launch_language():
+    """-language from Dota's launch options of the Steam account that played last: the game then mounts dota_<it>
+    instead of the Steam language folder (the D2PFX workaround for English clients sets -language dutch)."""
+    best = (-1, None)
+    for r in steam_roots():
+        users = os.path.join(r, "userdata")
+        for uid in os.listdir(users) if os.path.isdir(users) else []:
+            try:
+                with open(os.path.join(users, uid, "config", "localconfig.vdf"), encoding="utf-8", errors="ignore") as f:
+                    app = find_dota_app(parse_vdf(f.read()))
+            except OSError:
+                continue
+            if not app:
+                continue
+            when = int(app.get("LastPlayed") or (app.get("autocloud") or {}).get("lastlaunch") or 0)
+            m = re.search(r"(?:^|\s)[-+]language\s+(\w+)", app.get("LaunchOptions") or "")
+            if when > best[0]:
+                best = (when, m.group(1).lower() if m else None)
+    return best[1]
+
+
+def target(game):
+    """Where our paks go: the voice language folder (mounted before the game) or, for English, our own folder."""
+    forced = launch_language()
+    lang = forced or game_language(game)
+    folder = os.path.join(game, f"dota_{lang}")
+    if lang != "english" and (forced or os.path.exists(os.path.join(folder, "gameinfo.gi"))):
+        return "lang", folder
+    return "gameinfo", os.path.join(game, MOD_FOLDER)
+
+
+def dota_running():
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq dota2.exe"], capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        return "dota2.exe" in out.lower()
+    except OSError:
+        return False
+
+
+# ---------- downloads ----------
+
+def http_get(url, timeout=60):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+        return r.read()
+
+
+def cached_json(url, name, max_age):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = os.path.join(DATA_DIR, name)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f), False
+    try:
+        data = json.loads(http_get(url))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return data, False
+    except Exception:
+        with open(path, encoding="utf-8") as f:  # offline: the last copy we saw
+            return json.load(f), True
+
+
+def load_catalog():
+    return cached_json(CATALOG_URL, "catalog.json", 0)
+
+
+def fetch_file(url, sha256, name, log):
+    """Downloads into the cache once; a file whose SHA-256 doesn't match the catalog is never used."""
+    folder = os.path.join(DATA_DIR, "files")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, hashlib.sha1(url.encode()).hexdigest()[:16] + "_" + re.sub(r"[^\w.-]", "_", name)[-60:])
+
+    def ok():
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as f:
+            return not sha256 or hashlib.sha256(f.read()).hexdigest() == sha256
+    if not ok():
+        log(T(f"Скачиваю «{name}»…", f"Downloading “{name}”…"))
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=300) as r, open(path + ".part", "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(path + ".part", path)
+        if not ok():
+            os.remove(path)
+            raise RuntimeError(T(f"«{name}» скачался с ошибкой (не совпала контрольная сумма), попробуй ещё раз", f"“{name}” downloaded with an error (checksum mismatch), try again"))
+    return path
+
+
+# ---------- D2PFX catalog ----------
+
+def load_d2pfx():
+    """{category: [mod]} for the allowed categories; files and previews stay on D2PFX's GitHub until ticked."""
+    mods, _ = cached_json(D2PFX_RAW + "data/mods.json", "d2pfx_mods.json", 6 * 3600)
+    hashes, _ = cached_json(D2PFX_RAW + "data/mod-hashes.json", "d2pfx_hashes.json", 6 * 3600)
+    out = {}
+    for cat, *_labels in D2PFX_CATS:
+        items = mods.get("modsData", {}).get(cat)
+        if isinstance(items, dict):  # grouped categories (creep-deny: Deny and Lasthit)
+            items = [m for g in items.get("groups", []) for m in g.get("mods", [])]
+        if not isinstance(items, list):
+            continue
+        # a mod with colour styles is one file per style
+        items = [dict(m, name=f"{m.get('name', '')} {s.get('label', '')}".strip(), file=s.get("file"), preview=s.get("preview") or m.get("preview")) if s else m
+                 for m in items for s in m.get("styles") or [None]]
+        for m in items:
+            f = m.get("file") or ""
+            if not f or f.startswith("http") or m.get("type") == "guide" or not re.search(r"\.(zip|vpk)$", f, re.I):
+                continue
+            if D2PFX_SKIP.search(m.get("name") or ""):
+                continue
+            author = next((l.get("url") for l in m.get("links", []) if l.get("type") == "author"), None)
+            prev = m.get("preview") or ""
+            out.setdefault(cat, []).append({
+                "id": f"d2pfx:{cat}/{f}", "cat": cat, "name": m.get("name") or f, "author": author,
+                "url": D2PFX_RAW + "files/" + urllib.parse.quote(f"{cat}/{f}"), "sha256": hashes.get(f"{cat}/{f}"), "file": f,
+                "preview": D2PFX_RAW + "previews/" + urllib.parse.quote(f"{cat}/{prev}") if re.search(r"\.(webp|png|jpe?g|gif)$", prev, re.I) else None,
+            })
+    return out
+
+
+# ---------- build & install ----------
+
+def build_rules(game, catalog, mod_ids, tmp, log=print):
+    """Our rule mods: matching game files replaced by the game's own empty effect / silence, written into tmp."""
+    chosen = [m for m in catalog["mods"] if m["id"] in mod_ids and m.get("rules")]
+    if not chosen:
+        return 0
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    paths = list(pak)
+    blank, count = {}, 0
+    for m in chosen:
+        before = count
+        for rule in m["rules"]:
+            name = rule["template"]
+            tpl = catalog["templates"][name]
+            if name not in blank:  # a game file, or a blank downloaded by URL and checked by SHA-256
+                if isinstance(tpl, dict):
+                    with open(fetch_file(tpl["url"], tpl["sha256"], f"blank {name}", log), "rb") as f:
+                        blank[name] = f.read()
+                else:
+                    blank[name] = pak.get_file(tpl).read()
+            hit = set(rule["paths"]).__contains__ if "paths" in rule else re.compile(rule["match"]).search  # long exact lists
+            for p in paths:
+                if hit(p) and p != tpl:
+                    dst = os.path.join(tmp, *p.split("/"))
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with open(dst, "wb") as f:
+                        f.write(blank[name])
+                    count += 1
+        log(T(f"{loc(m['name'])}: {count - before} файлов", f"{loc(m['name'])}: {count - before} files"))
+    return count
+
+
+def resource_block(data, name):
+    """(offset, size) of a block in a compiled Source 2 resource (RED2, DATA, ...)."""
+    rel, count = struct.unpack_from("<II", data, 8)
+    for i in range(count):
+        p = 8 + rel + i * 12
+        if data[p:p + 4] == name.encode():
+            off, size = struct.unpack_from("<II", data, p + 4)
+            return p + 4 + off, size
+    raise ValueError(f"no {name} block")
+
+
+def patch_svgs(game, catalog, mod_ids, tmp, log=print):
+    """Colour edits inside compiled Panorama SVGs (vsvg_c). Their DATA block is a CRC32 of the SVG, two zero bytes and
+    the SVG text; edits keep the length, so only the CRC changes and the file layout stays the game's own."""
+    chosen = [m for m in catalog["mods"] if m["id"] in mod_ids and m.get("svg")]
+    if not chosen:
+        return 0
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    count = 0
+    for m in chosen:
+        for path, edits in m["svg"].items():
+            data = bytearray(pak.get_file(path).read())
+            off, size = resource_block(data, "DATA")
+            svg = bytes(data[off + 6:off + size])
+            if data[off + 4:off + 6] != b"\0\0" or struct.unpack_from("<I", data, off)[0] != zlib.crc32(svg):
+                raise RuntimeError(T(f"«{loc(m['name'])}»: формат файла в игре поменялся, мод нужно обновить", f"“{loc(m['name'])}”: the game changed the file format, the mod needs an update"))
+            for old, new in edits:
+                old, new = old.encode(), new.encode()
+                if len(old) != len(new) or old not in svg:
+                    raise RuntimeError(T(f"«{loc(m['name'])}»: игра обновила {path.rsplit('/', 1)[-1]}, мод нужно обновить", f"“{loc(m['name'])}”: the game updated {path.rsplit('/', 1)[-1]}, the mod needs an update"))
+                svg = svg.replace(old, new)
+            struct.pack_into("<I", data, off, zlib.crc32(svg))
+            data[off + 6:off + size] = svg
+            dst = os.path.join(tmp, *path.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(data)
+            count += 1
+        log(T(f"{loc(m['name'])}: {len(m['svg'])} файлов", f"{loc(m['name'])}: {len(m['svg'])} files"))
+    return count
+
+
+def sheet_sprites(data):
+    """{sprite name: (u0, v0, u1, v1)} from the SHEET extra data of a compiled texture."""
+    off, _ = resource_block(data, "DATA")
+    p = off + 32
+    rel, count = struct.unpack_from("<II", data, p)
+    out = {}
+    for i in range(count):
+        e = p + rel + i * 12
+        kind, erel, _size = struct.unpack_from("<III", data, e)
+        if kind != 2:  # SHEET
+            continue
+        s = e + 4 + erel
+        q = s + 8
+        for _ in range(struct.unpack_from("<I", data, s + 4)[0]):
+            frames = q + 8 + struct.unpack_from("<I", data, q + 8)[0]
+            name_at = q + 20 + struct.unpack_from("<I", data, q + 20)[0]
+            name = data[name_at:data.index(b"\0", name_at)].decode()
+            image = frames + 4 + struct.unpack_from("<I", data, frames + 4)[0]
+            out[name] = struct.unpack_from("<4f", data, image)
+            q += 32
+    return out
+
+
+def scale_dxt5(data, sprites, factors):
+    """Brightness of chosen sprites in a DXT5 sheet, on every mip level: the two colour endpoints of each 4x4 block
+    are scaled, the per-pixel indices and the alpha stay, so shapes and edges are the game's own."""
+    off, size = resource_block(data, "DATA")
+    w, h = struct.unpack_from("<HH", data, off + 20)
+    if data[off + 26] != 2:
+        raise RuntimeError(T("формат текстуры в игре поменялся, мод нужно обновить", "the game changed the texture format, the mod needs an update"))
+    mips = data[off + 27]
+    sizes = [max(1, (max(1, w >> i) + 3) // 4) * max(1, (max(1, h >> i) + 3) // 4) * 16 for i in range(mips)]
+    for level in range(mips):
+        start = off + size + sum(sizes[level + 1:])  # smallest mip first
+        lw, lh = max(1, w >> level), max(1, h >> level)
+        bw = (lw + 3) // 4
+        for name, k in factors.items():
+            u0, v0, u1, v1 = sprites[name]
+            for by in range(int(v0 * lh) // 4, (int(v1 * lh + 0.999) + 3) // 4):
+                for bx in range(int(u0 * lw) // 4, (int(u1 * lw + 0.999) + 3) // 4):
+                    q = start + (by * bw + bx) * 16 + 8
+                    for e in (q, q + 2):
+                        c = struct.unpack_from("<H", data, e)[0]
+                        r, g, b = min(31, int((c >> 11) * k)), min(63, int((c >> 5 & 63) * k)), min(31, int((c & 31) * k))
+                        struct.pack_into("<H", data, e, r << 11 | g << 5 | b)
+
+
+def patch_sheets(game, catalog, mod_ids, tmp, lang, log=print):
+    """Mods that make sprites of a texture sheet darker or brighter (the health bar sheet), in the base sheet and in
+    the copy for the game language, since the game draws from the one that matches -language."""
+    chosen = [m for m in catalog["mods"] if m["id"] in mod_ids and m.get("sheet")]
+    if not chosen:
+        return 0
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    names = set(pak)
+    count = 0
+    for m in chosen:
+        base = m["sheet"]["texture"]
+        for path in dict.fromkeys(f"{base}{sfx}.vtex_c" for sfx in ("", f"_{lang}")):
+            if path not in names:
+                continue
+            data = bytearray(pak.get_file(path).read())
+            sprites = sheet_sprites(data)
+            if any(s not in sprites for s in m["sheet"]["scale"]):
+                raise RuntimeError(T(f"«{loc(m['name'])}»: игра обновила полоски здоровья, мод нужно обновить", f"“{loc(m['name'])}”: the game updated the health bars, the mod needs an update"))
+            scale_dxt5(data, sprites, sheet_factors(m))
+            dst = os.path.join(tmp, *path.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(data)
+            count += 1
+        log(T(f"{loc(m['name'])}: {count} текстур", f"{loc(m['name'])}: {count} textures"))
+    return count
+
+
+def setting(m, key, default):
+    """A player's slider value for a mod, kept within the slider's limits."""
+    s = next((x for x in m.get("settings", []) if x["key"] == key), None)
+    v = load_settings().get(m["id"], {}).get(key, default)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, s["min"]), s["max"]) if s else v
+
+
+def tint(rgb, hue, sat=1.0, hues=None):
+    """One colour moved to the chosen hue with its lightness kept; greys, whites and colours outside `hues` stay."""
+    h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+    if s < 0.08 or not 0.03 < l < 0.97 or (hues and not hues[0] <= h * 360 <= hues[1]):
+        return rgb
+    return tuple(round(c * 255) for c in colorsys.hls_to_rgb(hue / 360, l, min(1.0, max(s, 0.5) * sat)))
+
+
+def paint_rgb(rgb, target, k=1.0):
+    """The site's hero paint colour: hue and saturation of the chosen colour, the pixel's own lightness moved toward
+    the chosen lightness (shading stays), blended by strength k. Same formula as assets/paint.js."""
+    th, tl, ts = colorsys.rgb_to_hls(*(c / 255 for c in target))
+    r, g, b = (c / 255 for c in rgb)
+    l = colorsys.rgb_to_hls(r, g, b)[1]
+    nl = l * 2 * tl if tl <= 0.5 else l + (1 - l) * (2 * tl - 1)
+    n = colorsys.hls_to_rgb(th, nl, ts)
+    return tuple(max(0, min(255, round((c + (d - c) * k) * 255))) for c, d in zip((r, g, b), n))
+
+
+def colorize(data, hue, sat=1.0, hues=None):
+    map_colors(data, lambda rgb: tint(rgb, hue, sat, hues))
+
+
+def map_colors(data, fn):
+    """Recolours a DXT1/DXT5/RGBA8888 texture on every mip level with fn(rgb) -> rgb. DXT colours are blends of two
+    endpoints per 4x4 block, so recolouring the endpoints recolours the block as the game draws it, no re-encoding."""
+    off, size = resource_block(data, "DATA")
+    w, h = struct.unpack_from("<HH", data, off + 20)
+    fmt, mips = data[off + 26], data[off + 27]
+    start = off + size
+    if fmt == 4:
+        for i in range(sum(max(1, w >> k) * max(1, h >> k) for k in range(mips))):
+            p = start + i * 4
+            data[p:p + 3] = bytes(fn(tuple(data[p:p + 3])))
+        return
+    if fmt == 28:  # BGRA8888
+        for i in range(sum(max(1, w >> k) * max(1, h >> k) for k in range(mips))):
+            p = start + i * 4
+            data[p:p + 3] = bytes(reversed(fn(tuple(reversed(data[p:p + 3])))))
+        return
+    if fmt == 16:  # a PNG stored as is (some ability icons): decode, recolour, store again; the header's size covers
+        # only the resource blocks, not the image after them, so it stays as it is
+        from PIL import Image
+        im = Image.open(io.BytesIO(bytes(data[start:]))).convert("RGBA")
+        px = im.load()
+        cache = {}
+        for y in range(im.height):
+            for x in range(im.width):
+                r, g, b, a = px[x, y]
+                if (r, g, b) not in cache:
+                    cache[(r, g, b)] = fn((r, g, b))
+                px[x, y] = (*cache[(r, g, b)], a)
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        data[start:] = buf.getvalue()
+        return
+    if fmt not in (1, 2):
+        raise RuntimeError(T("формат текстуры не поддерживается", "texture format not supported"))
+    bsize, coff = (8, 0) if fmt == 1 else (16, 8)
+    to565 = lambda c: (c[0] * 31 + 127) // 255 << 11 | (c[1] * 63 + 127) // 255 << 5 | (c[2] * 31 + 127) // 255
+    cache = {}
+
+    def new(c):
+        if c not in cache:
+            cache[c] = to565(fn(((c >> 11) * 255 // 31, (c >> 5 & 63) * 255 // 63, (c & 31) * 255 // 31)))
+        return cache[c]
+    for i in range(sum(max(1, (max(1, w >> k) + 3) // 4) * max(1, (max(1, h >> k) + 3) // 4) for k in range(mips))):
+        p = start + i * bsize + coff
+        c0, c1, idx = struct.unpack_from("<HHI", data, p)
+        n0, n1 = new(c0), new(c1)
+        if fmt == 1:  # in DXT1 the endpoint order picks 4-colour or 3-colour+transparent mode: keep the block's mode
+            if c0 > c1 and n0 <= n1:
+                if n0 == n1:
+                    n0, n1 = (n0, n1 - 1) if n1 else (n0 + 1, n1)
+                else:
+                    n0, n1, idx = n1, n0, idx ^ 0x55555555
+            elif c0 <= c1 and n0 > n1:
+                n0, n1 = n1, n0
+                idx = sum((((idx >> 2 * k) & 3) ^ (1 if (idx >> 2 * k) & 3 < 2 else 0)) << 2 * k for k in range(16))
+        struct.pack_into("<HHI", data, p, n0, n1, idx)
+
+
+PAINT_ID = "hero-paint"
+PAINT_DIRS = ("materials/models/", "panorama/images/spellicons/")
+
+
+def parse_paint(code):
+    """{texture path: (rgb, strength)} from a site code "D2AP1:<base64 json>"; anything outside hero textures and
+    ability icons, or not a colour, is dropped."""
+    code = (code or "").strip()
+    if not code.startswith("D2AP1:"):
+        raise ValueError(T("Это не код кастомизации героев: он начинается с D2AP1:", "This is not a hero customisation code: it starts with D2AP1:"))
+    data = json.loads(base64.b64decode(code[6:] + "=" * (-len(code[6:]) % 4)).decode("utf-8"))
+    out = {}
+    for path, v in (data.get("t") or {}).items():
+        if not (isinstance(path, str) and path.startswith(PAINT_DIRS) and path.endswith(".vtex_c") and ".." not in path):
+            continue
+        if not (isinstance(v, list) and len(v) >= 2 and isinstance(v[0], str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v[0])):
+            continue
+        out[path] = [v[0].lower(), min(1.0, max(0.0, float(v[1])))]
+    return out
+
+
+def save_paint(code):
+    t = parse_paint(code)
+    s = load_settings()
+    s[PAINT_ID] = {"t": t}
+    save_settings(s)
+    return len(t)
+
+
+def paint_textures(game, mod_ids, tmp, log=print):
+    if PAINT_ID not in mod_ids:
+        return 0
+    t = (load_settings().get(PAINT_ID) or {}).get("t") or {}
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    names = set(pak)
+    done = skipped = 0
+    for path, (hexc, k) in t.items():
+        if path not in names or not path.startswith(PAINT_DIRS):
+            skipped += 1
+            continue
+        data = bytearray(pak.get_file(path).read())
+        rgb = tuple(int(hexc[i:i + 2], 16) for i in (1, 3, 5))
+        try:
+            map_colors(data, lambda c, rgb=rgb, k=k: paint_rgb(c, rgb, k))
+        except RuntimeError:
+            skipped += 1
+            continue
+        dst = os.path.join(tmp, *path.split("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(data)
+        done += 1
+    log(T(f"Кастомизация героев: {done} текстур", f"Hero customisation: {done} textures") + (T(f", пропущено {skipped}", f", skipped {skipped}") if skipped else ""))
+    return done
+
+
+def paint_window():
+    """The site's 3D paint editor inside the app (Edge WebView2); "Apply in the game" saves the colours here."""
+    import webview
+
+    class Api:
+        def apply(self, code):
+            try:
+                n = save_paint(code)
+                return T(f"Сохранено текстур: {n}. Закрой это окно и нажми в D2A Mods «Установить выбранные».", f"Saved textures: {n}. Close this window and press Install selected in D2A Mods.")
+            except Exception as e:
+                return T(f"Не получилось: {e}", f"Failed: {e}")
+    webview.create_window(T("D2A Mods: кастомизация героев", "D2A Mods: hero customisation"), site_url("#paint"), js_api=Api(), width=1320, height=900, background_color="#0b0e14")
+    webview.start()
+
+
+def recolor_textures(game, catalog, mod_ids, tmp, log=print):
+    chosen = [m for m in catalog["mods"] if m["id"] in mod_ids and m.get("recolor")]
+    if not chosen:
+        return 0
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    names = set(pak)
+    count = 0
+    for m in chosen:
+        rc = m["recolor"]
+        hue = setting(m, "hue", rc["hue"])
+        for path in rc["textures"]:
+            if path not in names:
+                raise RuntimeError(T(f"«{loc(m['name'])}»: игра обновила текстуры, мод нужно обновить", f"“{loc(m['name'])}”: the game updated the textures, the mod needs an update"))
+            data = bytearray(pak.get_file(path).read())
+            colorize(data, hue, rc.get("sat", 1.0), rc.get("hues"))
+            dst = os.path.join(tmp, *path.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(data)
+            count += 1
+        log(T(f"{loc(m['name'])}: {len(rc['textures'])} текстур", f"{loc(m['name'])}: {len(rc['textures'])} textures"))
+    return count
+
+
+def git_blob_ok(data, sha):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() == sha
+
+
+def place_files(mod, tmp, log):
+    """A file mod: every file from the pinned commit, cached on disk and checked against its git hash."""
+    base, items = mod["files"]["base"], mod["files"]["list"]
+    cache = os.path.join(DATA_DIR, "files", "git")
+    os.makedirs(cache, exist_ok=True)
+    log(T(f"Скачиваю «{loc(mod['name'])}» ({len(items)} файлов)…", f"Downloading “{loc(mod['name'])}” ({len(items)} files)…"))
+
+    def one(item):
+        rel, sha = item
+        if ".." in rel.split("/") or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise RuntimeError(T(f"Странный путь в моде: {rel}", f"Odd path in the mod: {rel}"))
+        path = os.path.join(cache, sha)
+        data = None
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read()
+        if data is None or not git_blob_ok(data, sha):
+            data = http_get(base + urllib.parse.quote(rel), 120)
+            if not git_blob_ok(data, sha):
+                raise RuntimeError(T(f"Файл «{rel}» скачался с ошибкой, попробуй ещё раз", f"File “{rel}” downloaded with an error, try again"))
+            with open(path, "wb") as f:
+                f.write(data)
+        dst = os.path.join(tmp, *rel.split("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(data)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(one, items))
+    return len(items)
+
+
+def loose_path(name):
+    """Game path for a loose file from a D2PFX zip ("<Mod name>/cursor/x.ani" -> "resource/cursor/x.ani"), or None."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    if not parts or ".." in parts or ":" in parts[0]:
+        return None
+    for i, p in enumerate(parts):
+        if p in GAME_DIRS:
+            return "/".join(parts[i:])
+        if p == "cursor":
+            return "/".join(["resource"] + parts[i:])
+    return None
+
+
+def place_d2pfx(mod, folder, numbers, tmp, log):
+    """Copies a D2PFX mod: VPKs as they are under a free pak number, loose files into tmp for our own VPK."""
+    path = fetch_file(mod["url"], mod["sha256"], mod["name"], log)
+    written, number = [], None
+    if mod["file"].lower().endswith(".vpk"):
+        dst = os.path.join(folder, f"pak{next(numbers):02d}_dir.vpk")
+        shutil.copyfile(path, dst)
+        return [os.path.basename(dst)], 0
+    loose = 0
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            base = os.path.basename(info.filename.replace("\\", "/"))
+            m = re.fullmatch(r"pak\d+_(dir|\d{3})\.vpk", base, re.I)
+            if m:  # keep multi-part VPKs together under one number
+                number = number or next(numbers)
+                dst = os.path.join(folder, f"pak{number:02d}_{m.group(1).lower()}.vpk")
+                with z.open(info) as src, open(dst, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                written.append(os.path.basename(dst))
+                continue
+            gp = loose_path(info.filename)
+            if gp:
+                dst = os.path.join(tmp, *gp.split("/"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with z.open(info) as src, open(dst, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                loose += 1
+    if not written and not loose:
+        raise RuntimeError(T(f"В моде «{mod['name']}» не нашлось файлов игры", f"No game files found in “{mod['name']}”"))
+    return written, loose
+
+
+def backup_root(game):
+    return os.path.join(DATA_DIR, "backup", hashlib.sha1(os.path.normcase(game).encode()).hexdigest()[:10])
+
+
+def replace_loose(game, rel, data):
+    """Writes a file straight into the game folder (fonts, some texts); the original goes to our backup first."""
+    dst, bak = os.path.join(game, *rel.split("/")), os.path.join(backup_root(game), *rel.split("/"))
+    if os.path.exists(dst) and not os.path.exists(bak):
+        os.makedirs(os.path.dirname(bak), exist_ok=True)
+        shutil.copy2(dst, bak)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as f:
+        f.write(data)
+    return rel
+
+
+def restore_loose(game, rels):
+    """Puts the originals back; a file the game didn't have before is removed."""
+    for rel in rels:
+        src, dst = os.path.join(backup_root(game), *rel.split("/")), os.path.join(game, *rel.split("/"))
+        try:
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                os.remove(src)
+            elif os.path.exists(dst):
+                os.remove(dst)
+        except OSError:
+            pass
+
+
+def place_font(mod, game, log):
+    """A D2PFX font: the files from assets/custom/ replace the game's fonts."""
+    path = fetch_file(mod["url"], mod["sha256"], mod["name"], log)
+    written = []
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            parts = info.filename.replace("\\", "/").lower().split("/")
+            if info.is_dir() or "custom" not in parts[:-1] or not re.fullmatch(r"[\w.-]+\.(otf|ttf)", parts[-1]):
+                continue
+            written.append(replace_loose(game, f"dota/panorama/fonts/{parts[-1]}", z.read(info)))
+    if not written:
+        raise RuntimeError(T(f"В шрифте «{mod['name']}» не нашлось файлов шрифта", f"No font files found in “{mod['name']}”"))
+    return written
+
+
+def english_ui(game, lang, tmp, log):
+    """English text on a client started with -language <lang>: the game's *_english texts under *_<lang> names,
+    in our VPK for the pak ones and in place (with a backup) for the loose ones in core/ and dota_addons/."""
+    eng = re.compile(r"_english(\.(txt|vtt))$")
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    n = 0
+    for p in pak:
+        if eng.search(p):
+            dst = os.path.join(tmp, *eng.sub(rf"_{lang}\1", p).split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(pak.get_file(p).read())
+            n += 1
+    loose = []
+    for sub in ("core", "dota_addons"):
+        for dirpath, _, names in os.walk(os.path.join(game, sub)):
+            for name in names:
+                src = os.path.join(dirpath, re.sub(rf"_{lang}(\.(txt|vtt))$", r"_english\1", name))
+                if src != os.path.join(dirpath, name) and os.path.isfile(src):
+                    with open(src, "rb") as f:
+                        loose.append(replace_loose(game, os.path.relpath(os.path.join(dirpath, name), game).replace("\\", "/"), f.read()))
+    log(T(f"Английский интерфейс: {n + len(loose)} файлов текста", f"English interface: {n + len(loose)} text files"))
+    return n, loose
+
+
+def settings_path():
+    return os.path.join(DATA_DIR, "settings.json")
+
+
+def load_settings():
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(s):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(settings_path(), "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=1)
+
+
+def sheet_factors(m):
+    """The mod's brightness per sprite: the catalog default, or what the player set with the sliders (within limits)."""
+    own = load_settings().get(m["id"], {})
+    limits = {s["key"]: (s["min"], s["max"]) for s in m.get("settings", [])}
+    out = dict(m["sheet"]["scale"])
+    for k, v in own.items():
+        if k in out and k in limits:
+            out[k] = min(max(float(v), limits[k][0]), limits[k][1])
+    return out
+
+
+# ---------- arsenal: cosmetic item swap from the player's own game files ----------
+
+ARSENAL_ID = "arsenal"
+ARSENAL_CATALOG_URL = SITE + "arsenal/catalog.json"
+ARSENAL_SKIP_PREFABS = {
+    'courier', 'courier_wearable', 'ward', 'loading_screen', 'pennant',
+    'taunt', 'tool', 'bundle', 'retired_treasure', 'treasure_chest',
+    'dynamic_recipe', 'recipe', 'emoticon', 'spray', 'terrain',
+    'music', 'announcer', 'mega_kills', 'hud_skin', 'cursor_pack',
+    'player_card', 'gem', 'effigy', 'summons', 'pet',
+    'persona_selector', 'guild_item',
+}
+ARSENAL_HERO_PREFABS = {'wearable', 'default_item'}
+ARSENAL_RARITY = {'arcana': 6, 'ancient': 5, 'immortal': 5, 'legendary': 4, 'mythical': 3, 'rare': 2, 'uncommon': 1, 'common': 0}
+
+
+def parse_items_game(text):
+    """Valve KeyValues text → nested dict (handles items_game.txt quirks)."""
+    text = re.sub(r'//[^\n]*', '', text)
+    tokens = re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text)
+    root, stack = {}, []
+    cur, key = root, None
+    for s, brace in tokens:
+        if brace == '{':
+            child = {}
+            if key and key in cur and isinstance(cur[key], dict):
+                child = cur[key]
+            if key:
+                cur[key] = child
+            stack.append(cur)
+            cur = child
+            key = None
+        elif brace == '}':
+            cur = stack.pop() if stack else root
+        elif key is None:
+            key = s
+        else:
+            if not (key in cur and isinstance(cur[key], dict)):
+                cur[key] = s
+            key = None
+    return root
+
+
+def _resolve_prefab(prefabs, name):
+    seen, merged = set(), {}
+    names = [p.strip() for p in name.split()] if name else []
+    while names:
+        n = names.pop(0)
+        if n in seen:
+            continue
+        seen.add(n)
+        p = prefabs.get(n)
+        if not p or not isinstance(p, dict):
+            continue
+        parent = p.get('prefab', '')
+        if parent:
+            names.extend(parent.split())
+        for k, v in p.items():
+            if k not in merged:
+                merged[k] = v
+    return merged
+
+
+def _item_val(item, prefab, key):
+    v = item.get(key)
+    return v if v is not None else prefab.get(key)
+
+
+def _item_hero(item, prefab):
+    heroes = item.get('used_by_heroes') or prefab.get('used_by_heroes')
+    if not heroes or not isinstance(heroes, dict):
+        return None
+    for h, v in heroes.items():
+        if v == '1' and h.startswith('npc_dota_hero_'):
+            return h
+    return None
+
+
+def _item_models(item, prefab):
+    paths = set()
+    mp = _item_val(item, prefab, 'model_player')
+    if mp and mp.endswith('.vmdl'):
+        paths.add(mp)
+    for src in (item, prefab):
+        vis = src.get('visuals') if isinstance(src, dict) else None
+        if not isinstance(vis, dict):
+            continue
+        for k, v in vis.items():
+            if not isinstance(v, dict):
+                continue
+            if v.get('type') in ('particle', 'particle_create'):
+                continue
+            asset = v.get('asset') or v.get('modifier')
+            if asset and isinstance(asset, str) and asset.endswith('.vmdl'):
+                paths.add(asset)
+    return paths
+
+
+def _item_particles(item, prefab):
+    particles = []
+    for src in (item, prefab):
+        vis = src.get('visuals') if isinstance(src, dict) else None
+        if not isinstance(vis, dict):
+            continue
+        for k, v in vis.items():
+            if not isinstance(v, dict):
+                continue
+            if v.get('type') in ('particle', 'particle_create'):
+                asset = v.get('modifier') or v.get('asset')
+                if asset:
+                    particles.append(asset)
+    return particles
+
+
+def build_arsenal_catalog(game):
+    """Parse items_game.txt from the local Dota install → {hero_slug: {npc, slots: {slot: [items]}}}."""
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    raw = pak.get_file('scripts/items/items_game.txt').read().decode('utf-8', errors='replace')
+    ig = parse_items_game(raw)
+    ig = ig.get('items_game') or ig
+    items = ig.get('items') or {}
+    prefabs = ig.get('prefabs') or {}
+    item_sets = ig.get('item_sets') or {}
+
+    set_lookup = {}
+    for sn, sd in item_sets.items():
+        if isinstance(sd, dict) and isinstance(sd.get('items'), dict):
+            for iname in sd['items']:
+                set_lookup[iname] = sn
+
+    # localization
+    try:
+        loc_raw = pak.get_file('resource/localization/items_english.txt').read()
+        loc_raw = loc_raw.decode('utf-16-le', errors='replace') if loc_raw[:2] == b'\xff\xfe' else loc_raw.decode('utf-8', errors='replace')
+        loc_d = parse_items_game(loc_raw)
+        tokens = {}
+        for top in loc_d.values():
+            if isinstance(top, dict):
+                t = top.get('Tokens') or top.get('tokens') or top
+                if isinstance(t, dict):
+                    tokens.update({k.lower(): v for k, v in t.items() if isinstance(v, str)})
+    except Exception:
+        tokens = {}
+
+    # first pass: collect default items (base models) per hero per slot
+    defaults = {}  # {hero_slug: {slot: model_player_path}}
+    heroes = {}
+    for def_id, item in items.items():
+        if not isinstance(item, dict) or not def_id or not def_id.isdigit():
+            continue
+        pname = item.get('prefab', '')
+        pres = _resolve_prefab(prefabs, pname)
+        base_p = set(pname.split()) | set(pres.get('prefab', '').split())
+        if base_p & ARSENAL_SKIP_PREFABS:
+            continue
+
+        hero_npc = _item_hero(item, pres)
+        if not hero_npc:
+            continue
+        hero_slug = hero_npc.replace('npc_dota_hero_', '')
+        slot = _item_val(item, pres, 'item_slot') or ''
+
+        # collect default items for model swapping
+        if 'default_item' in base_p and slot:
+            mp = _item_val(item, pres, 'model_player')
+            if mp and mp.endswith('.vmdl'):
+                defaults.setdefault(hero_slug, {})[slot] = mp
+
+        if not (base_p & ARSENAL_HERO_PREFABS) and not any('wearable' in p for p in base_p):
+            continue
+        if 'persona' in pname.lower() or _item_val(item, pres, 'persona_id'):
+            continue
+
+        rarity = _item_val(item, pres, 'item_rarity') or 'common'
+        if ARSENAL_RARITY.get(rarity, 0) < 2:
+            continue
+        if not slot:
+            continue
+
+        models = _item_models(item, pres)
+        particles = _item_particles(item, pres)
+        if not models and not particles:
+            continue
+
+        name_token = _item_val(item, pres, 'item_name')
+        display = tokens.get((name_token or '').lstrip('#').lower()) or item.get('name', f'item_{def_id}')
+        internal = item.get('name', '')
+
+        entry = {'id': int(def_id), 'name': display, 'internal': internal,
+                 'slot': slot, 'rarity': rarity, 'models': sorted(models)}
+        if particles:
+            entry['particles'] = particles
+        sn = set_lookup.get(internal)
+        if sn:
+            entry['set'] = sn
+
+        hd = heroes.setdefault(hero_slug, {'npc': hero_npc, 'items': []})
+        hd['items'].append(entry)
+
+    for slug, hd in heroes.items():
+        hd['items'].sort(key=lambda x: (-ARSENAL_RARITY.get(x['rarity'], 0), x['slot'], x['name']))
+        hd['defaults'] = defaults.get(slug, {})
+    return heroes
+
+
+def load_arsenal_catalog(game):
+    """Build or load cached arsenal catalog."""
+    cache = os.path.join(DATA_DIR, "arsenal_catalog.json")
+    pak_path = os.path.join(game, "dota", "pak01_dir.vpk")
+    pak_mtime = os.path.getmtime(pak_path) if os.path.exists(pak_path) else 0
+    if os.path.exists(cache) and os.path.getmtime(cache) >= pak_mtime:
+        with open(cache, encoding="utf-8") as f:
+            return json.load(f)
+    heroes = build_arsenal_catalog(game)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(cache, "w", encoding="utf-8") as f:
+        json.dump(heroes, f, ensure_ascii=False)
+    return heroes
+
+
+def parse_arsenal_code(code):
+    """Parse a D2AA1 code from the site → {hero_slug: [item_id, ...]}."""
+    code = (code or "").strip()
+    if not code.startswith("D2AA1:"):
+        raise ValueError(T("Это не код арсенала: он начинается с D2AA1:", "This is not an arsenal code: it starts with D2AA1:"))
+    data = json.loads(base64.b64decode(code[6:] + "=" * (-len(code[6:]) % 4)).decode("utf-8"))
+    return data.get("items") or {}
+
+
+def save_arsenal(item_ids):
+    """Save the user's arsenal selection: {hero_slug: [item_id, ...]}."""
+    s = load_settings()
+    s[ARSENAL_ID] = {"items": item_ids}
+    save_settings(s)
+
+
+def save_arsenal_code(code):
+    items = parse_arsenal_code(code)
+    save_arsenal(items)
+    total = sum(len(v) for v in items.values())
+    return total
+
+
+def _collect_related_files(pak, pak_paths, base_path):
+    """Given a .vmdl path, collect the compiled model and all related material/texture files."""
+    files = {}
+    compiled = base_path + '_c' if not base_path.endswith('_c') else base_path
+    if compiled in pak_paths:
+        files[compiled] = pak.get_file(compiled).read()
+
+    stem = base_path.rsplit('.', 1)[0]
+    for suffix in ('.vmdl_c', '.vmesh_c', '.vagrp_c', '.vseq_c', '.vphys_c'):
+        p = stem + suffix
+        if p in pak_paths:
+            files[p] = pak.get_file(p).read()
+
+    mat_dir = stem.replace('models/', 'materials/models/', 1) if stem.startswith('models/') else None
+    if mat_dir:
+        prefix = mat_dir.rsplit('/', 1)[0] + '/'
+        for p in pak_paths:
+            if p.startswith(prefix) and p.endswith(('.vmat_c', '.vtex_c')):
+                if p not in files:
+                    files[p] = pak.get_file(p).read()
+    return files
+
+
+def _write_file(tmp, rel_path, data):
+    dst = os.path.join(tmp, *rel_path.split("/"))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as f:
+        f.write(data)
+
+
+def arsenal_install(game, tmp, log=print):
+    """Swap default hero models with selected cosmetic items from pak01_dir.vpk."""
+    sel = (load_settings().get(ARSENAL_ID) or {}).get("items")
+    if not sel:
+        return 0
+    item_ids = set()
+    for ids in sel.values():
+        item_ids.update(ids)
+    if not item_ids:
+        return 0
+
+    log(T("Арсенал: читаю каталог предметов…", "Arsenal: reading item catalog…"))
+    heroes = load_arsenal_catalog(game)
+
+    item_by_id = {}
+    for hslug, hdata in heroes.items():
+        for it in hdata['items']:
+            item_by_id[it['id']] = (hslug, it)
+
+    chosen = [(item_by_id[iid]) for iid in item_ids if iid in item_by_id]
+    if not chosen:
+        return 0
+
+    pak = vpk.open(os.path.join(game, "dota", "pak01_dir.vpk"))
+    pak_paths = set(pak)
+    count = 0
+
+    for hero_slug, item in chosen:
+        slot = item.get('slot', '')
+        hero_defaults = heroes.get(hero_slug, {}).get('defaults', {})
+        default_model = hero_defaults.get(slot)
+        item_models = item.get('models', [])
+
+        if default_model and item_models:
+            # swap: copy the cosmetic item's compiled model to the default model's path
+            default_compiled = default_model + '_c'
+            cosmetic_model = item_models[0]
+            cosmetic_compiled = cosmetic_model + '_c' if not cosmetic_model.endswith('_c') else cosmetic_model
+            if cosmetic_compiled in pak_paths and default_compiled in pak_paths:
+                data = pak.get_file(cosmetic_compiled).read()
+                _write_file(tmp, default_compiled, data)
+                count += 1
+                log(T(f"  {item['name']}: подмена {slot}", f"  {item['name']}: swap {slot}"))
+
+            # also copy the cosmetic item's mesh/material files so the swapped model can reference them
+            related = _collect_related_files(pak, pak_paths, cosmetic_model)
+            for fpath, fdata in related.items():
+                if fpath != cosmetic_compiled:
+                    _write_file(tmp, fpath, fdata)
+                    count += 1
+        else:
+            # no default found — just place cosmetic files at their own paths (particles, etc.)
+            for model_path in item_models:
+                related = _collect_related_files(pak, pak_paths, model_path)
+                for fpath, fdata in related.items():
+                    _write_file(tmp, fpath, fdata)
+                    count += 1
+
+        for pcf in item.get('particles', []):
+            compiled = pcf + '_c' if not pcf.endswith('_c') else pcf
+            if compiled in pak_paths:
+                _write_file(tmp, compiled, pak.get_file(compiled).read())
+                count += 1
+
+    log(T(f"Арсенал: {count} файлов из {len(chosen)} предметов", f"Arsenal: {count} files from {len(chosen)} items"))
+    return count
+
+
+def state_path():
+    return os.path.join(DATA_DIR, "installed.json")
+
+
+def load_state():
+    try:
+        with open(state_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(state_path(), "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+
+
+def gameinfo_path(game):
+    return os.path.join(game, "dota", "gameinfo.gi")
+
+
+def is_mounted(game):
+    with open(gameinfo_path(game), encoding="utf-8") as f:
+        return MARK in f.read()
+
+
+def mount(game):
+    gi = gameinfo_path(game)
+    with open(gi, encoding="utf-8") as f:
+        text = f.read()
+    if MARK in text:
+        return
+    backup = gi + ".d2a-backup"
+    if not os.path.exists(backup):
+        shutil.copy2(gi, backup)
+    new, n = re.subn(r"(\n([ \t]*)Game[ \t]+dota[ \t]*\n)", lambda m: f"\n{m.group(2)}Game\t\t\t\t{MOD_FOLDER}\t{MARK}{m.group(1)}", text, count=1)
+    if not n:
+        raise RuntimeError(T("Не нашёл строку «Game dota» в gameinfo.gi: формат файла изменился", "No “Game dota” line in gameinfo.gi: the file format changed"))
+    with open(gi, "w", encoding="utf-8") as f:
+        f.write(new)
+
+
+def unmount(game):
+    gi = gameinfo_path(game)
+    with open(gi, encoding="utf-8") as f:
+        text = f.read()
+    if MARK in text:
+        with open(gi, "w", encoding="utf-8") as f:
+            f.write("".join(line for line in text.splitlines(keepends=True) if MARK not in line))
+
+
+def remove_ours(game):
+    """Deletes exactly the files we put there before (and the 1.0/1.1 layout), nothing else."""
+    st = load_state()
+    rec = st.pop(game, None)
+    if rec:
+        for name in rec.get("files", []):
+            try:
+                os.remove(os.path.join(rec["folder"], name))
+            except OSError:
+                pass
+        legacy = os.path.join(backup_root(game), "fonts")  # 1.3.0 kept font backups in their own folder
+        for name in rec.get("fonts", []):
+            if os.path.exists(os.path.join(legacy, name)):
+                os.makedirs(os.path.join(backup_root(game), "dota", "panorama", "fonts"), exist_ok=True)
+                os.replace(os.path.join(legacy, name), os.path.join(backup_root(game), "dota", "panorama", "fonts", name))
+        restore_loose(game, rec.get("loose", []) + [f"dota/panorama/fonts/{n}" for n in rec.get("fonts", [])])
+    unmount(game)
+    shutil.rmtree(os.path.join(game, MOD_FOLDER), ignore_errors=True)
+    save_state(st)
+
+
+def install(game, catalog, d2pfx, ids, log=print):
+    if dota_running():
+        raise RuntimeError(T("Закрой Dota 2 перед установкой", "Close Dota 2 before installing"))
+    method, folder = target(game)
+    lang = os.path.basename(folder)[len("dota_"):] if method == "lang" else "english"
+    if ENGLISH_ID in ids and lang == "english":
+        raise RuntimeError(T("Чтобы моды работали с английским интерфейсом, поставь в параметрах запуска Dota «-language dutch» "
+                             "(Steam → Dota 2 → Свойства → Параметры запуска) вместо «-language english» и нажми «Установить» ещё раз.",
+                             "For mods with an English interface, set -language dutch in the Dota launch options "
+                             "(Steam → Dota 2 → Properties → Launch options) instead of -language english and press Install again."))
+    remove_ours(game)
+    os.makedirs(folder, exist_ok=True)
+    taken = {f.lower() for f in os.listdir(folder)}
+    numbers = (n for n in range(PAK_FIRST, 100) if not any(t.startswith(f"pak{n:02d}_") for t in taken))
+    files, replaced, total = [], [], 0
+    by_id = {m["id"]: m for ms in (d2pfx or {}).values() for m in ms}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            total += build_rules(game, catalog, ids, tmp, log)
+            total += patch_svgs(game, catalog, ids, tmp, log)
+            total += patch_sheets(game, catalog, ids, tmp, lang, log)
+            total += recolor_textures(game, catalog, ids, tmp, log)
+            total += paint_textures(game, ids, tmp, log)
+            total += arsenal_install(game, tmp, log)
+            for m in catalog["mods"]:
+                if m["id"] in ids and m.get("files"):
+                    total += place_files(m, tmp, log)
+            if ENGLISH_ID in ids:
+                n, texts = english_ui(game, lang, tmp, log)
+                replaced += texts
+                total += n + len(texts)
+            for mid in [i for i in ids if i in by_id]:
+                if by_id[mid]["cat"] == "fonts":
+                    written = place_font(by_id[mid], game, log)
+                    replaced += written
+                    total += len(written)
+                    continue
+                written, loose = place_d2pfx(by_id[mid], folder, numbers, tmp, log)
+                files += written
+                total += loose + len(written)
+            if any(os.scandir(tmp)):
+                dst = os.path.join(folder, f"pak{next(numbers):02d}_dir.vpk")
+                vpk.new(tmp).save(dst)
+                files.append(os.path.basename(dst))
+    except StopIteration:
+        raise RuntimeError(T("Слишком много модов сразу: в папке закончились свободные номера pak60–pak99", "Too many mods at once: the folder ran out of free numbers pak60–pak99"))
+    finally:
+        st = load_state()
+        st[game] = {"folder": folder, "files": files, "loose": replaced, "mods": sorted(ids), "method": method, "app": APP_VERSION}
+        save_state(st)
+    if not files and not replaced:
+        raise RuntimeError(T("Ни один файл не подошёл под выбранные моды", "No game files matched the selected mods"))
+    if method == "gameinfo" and files:
+        mount(game)
+    return total
+
+
+def uninstall(game):
+    if dota_running():
+        raise RuntimeError(T("Закрой Dota 2 перед удалением", "Close Dota 2 before removing mods"))
+    remove_ours(game)
+
+
+def installed_ids(game):
+    rec = load_state().get(game) or {}
+    if rec and not all(os.path.exists(os.path.join(rec["folder"], f)) for f in rec.get("files", [])):
+        return set()
+    return set(rec.get("mods", []))
+
+
+def needs_reapply(game):
+    rec = load_state().get(game) or {}
+    return rec.get("method") == "gameinfo" and rec.get("files") and not is_mounted(game)
+
+
+# ---------- window ----------
+
+def run_gui():
+    import tkinter as tk
+    import webbrowser
+    from tkinter import filedialog, messagebox
+
+    try:
+        from PIL import Image, ImageChops, ImageTk
+    except ImportError:
+        Image = ImageChops = ImageTk = None
+
+    C = {"bg": "#0b0e14", "panel": "#151a23", "panel2": "#1c222d", "line": "#2a313e", "fg": "#e8ecf2", "muted": "#96a0b2",
+         "gold": "#e3b04b", "gold2": "#f5cd78", "dark": "#1a1408"}
+    F = "Segoe UI"
+    root = tk.Tk()
+    root.title(f"D2A Mods {APP_VERSION}")
+    try:  # the icon is bundled next to the code (PyInstaller unpacks it into _MEIPASS)
+        root.iconbitmap(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico"))
+    except Exception:
+        pass
+    root.configure(bg=C["bg"])
+    root.geometry("1040x700")
+    root.minsize(680, 500)
+    st = {"game": find_dota(), "catalog": None, "d2pfx": None, "tab": None, "cat": D2PFX_CATS[0][0], "query": "",
+          "sel": set(), "busy": False, "cols": 0, "thumbs": {}, "loading": set()}
+    pool = ThreadPoolExecutor(max_workers=6)
+
+    def button(parent, text, cmd, primary=False):
+        base, hover = (C["gold"], C["gold2"]) if primary else (C["panel2"], C["line"])
+        b = tk.Label(parent, text=text, bg=base, fg=C["dark"] if primary else C["fg"], font=(F, 10, "bold"), padx=16, pady=9, cursor="hand2")
+        b.bind("<Button-1>", lambda e: None if st["busy"] else cmd())
+        b.bind("<Enter>", lambda e: b.configure(bg=hover))
+        b.bind("<Leave>", lambda e: b.configure(bg=base))
+        return b
+
+    head = tk.Frame(root, bg=C["bg"])
+    head.pack(fill="x", padx=20, pady=(16, 6))
+    tk.Label(head, text="D2A Mods", bg=C["bg"], fg=C["gold"], font=(F, 20, "bold")).pack(side="left")
+    path_var = tk.StringVar(value=st["game"] or T("Dota 2 не найдена", "Dota 2 not found"))
+    button(head, T("Папка игры", "Game folder"), lambda: pick()).pack(side="right")
+    button(head, "EN" if LANG == "ru" else "RU", lambda: switch_lang()).pack(side="right", padx=(0, 8))
+    heart = tk.Label(head, text="♥", bg=C["bg"], fg=C["muted"], font=(F, 14), padx=8, cursor="hand2")
+    heart.bind("<Button-1>", lambda e: webbrowser.open(SITE + "#support"))
+    heart.bind("<Enter>", lambda e: heart.configure(fg="#ff6b8a"))
+    heart.bind("<Leave>", lambda e: heart.configure(fg=C["muted"]))
+
+    def show_heart():  # quiet: shown only when the site lists ways to support
+        try:
+            if json.loads(http_get(SITE + "support.json", 10)).get("links"):
+                root.after(0, lambda: heart.pack(side="right", before=path_label))
+        except Exception:
+            pass
+    threading.Thread(target=show_heart, daemon=True).start()
+    path_label = tk.Label(head, textvariable=path_var, bg=C["bg"], fg=C["muted"], font=(F, 9))
+    path_label.pack(side="right", padx=10)
+
+    tabs_row = tk.Frame(root, bg=C["bg"])
+    tabs_row.pack(fill="x", padx=20, pady=(4, 4))
+    sub = tk.Frame(root, bg=C["bg"])  # D2PFX categories + search, shown only on that tab
+    cats_row = tk.Frame(sub, bg=C["bg"])
+    cats_row.pack(fill="x")
+    search_row = tk.Frame(sub, bg=C["bg"])
+    search_row.pack(fill="x", pady=(6, 0))
+    qvar = tk.StringVar()
+    entry = tk.Entry(search_row, textvariable=qvar, bg=C["panel"], fg=C["fg"], insertbackground=C["fg"], relief="flat", font=(F, 10), width=28)
+    entry.pack(side="left", ipady=5, ipadx=6)
+    tk.Label(search_row, text=T("поиск", "search"), bg=C["bg"], fg=C["muted"], font=(F, 9)).pack(side="left", padx=8)
+    credit = tk.Label(search_row, text=T("Моды из Dota2PornFx · авторы модов", "Mods from Dota2PornFx · mod authors"), bg=C["bg"], fg=C["gold"], font=(F, 9, "underline"), cursor="hand2")
+    credit.pack(side="right")
+    credit.bind("<Button-1>", lambda e: webbrowser.open(D2PFX_SITE))
+    tk.Label(search_row, text="", bg=C["bg"]).pack(side="right")
+
+    foot = tk.Frame(root, bg=C["bg"])
+    foot.pack(side="bottom", fill="x", padx=20, pady=(6, 14))
+    status = tk.StringVar()
+    tk.Label(foot, textvariable=status, bg=C["bg"], fg=C["muted"], font=(F, 9), anchor="w", justify="left").pack(fill="x", pady=(0, 8))
+    row = tk.Frame(foot, bg=C["bg"])
+    row.pack(fill="x")
+    count_var = tk.StringVar()
+    button(row, T("Установить выбранные", "Install selected"), lambda: do_install(), primary=True).pack(side="left")
+    button(row, T("Удалить все моды", "Remove all mods"), lambda: do_uninstall()).pack(side="left", padx=8)
+    button(row, T("Выбрать все", "Select all"), lambda: select_view(True)).pack(side="left")
+    button(row, T("Снять все", "Clear all"), lambda: select_view(False)).pack(side="left", padx=8)
+    tk.Label(row, textvariable=count_var, bg=C["bg"], fg=C["gold"], font=(F, 10, "bold")).pack(side="left", padx=8)
+    def paste_arsenal():
+        try:
+            n = save_arsenal_code(root.clipboard_get())
+            st["sel"].add(ARSENAL_ID)
+            draw()
+            messagebox.showinfo("D2A Mods", T(f"Арсенал принят: {n} предметов.", f"Arsenal accepted: {n} items."))
+        except Exception as e:
+            messagebox.showerror("D2A Mods", T(f"Не получилось прочитать код арсенала: {e}", f"Could not read the arsenal code: {e}"))
+    button(row, T("Арсенал", "Arsenal"), lambda: webbrowser.open(site_url("#arsenal"))).pack(side="right", padx=(0, 8))
+    button(row, T("Вставить арсенал", "Paste arsenal"), paste_arsenal).pack(side="right", padx=(0, 8))
+    button(row, T("Сайт", "Website"), lambda: webbrowser.open(site_url("#mods"))).pack(side="right")
+
+    wrap = tk.Frame(root, bg=C["bg"])
+    wrap.pack(fill="both", expand=True, padx=(20, 8))
+    canvas = tk.Canvas(wrap, bg=C["bg"], highlightthickness=0)
+    bar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=bar.set)
+    bar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    grid = tk.Frame(canvas, bg=C["bg"])
+    win = canvas.create_window((0, 0), window=grid, anchor="nw")
+    grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    def view_items():
+        if st["tab"] == "d2pfx":
+            items = (st["d2pfx"] or {}).get(st["cat"], [])
+            q = st["query"].strip().lower()
+            return [m for m in items if q in m["name"].lower()] if q else items
+        # a mod that needs a newer app stays hidden instead of failing at install
+        return [m for m in st["catalog"]["mods"] if m.get("tab", "optimize") == st["tab"] and ver(m.get("min_app")) <= ver(APP_VERSION)]
+
+    def thumb(m, label):
+        """Preview images load in the background and are cached on disk."""
+        key = m["preview"]
+        if not key or Image is None:
+            return
+        if key in st["thumbs"]:
+            label.configure(image=st["thumbs"][key])
+            return
+        if key in st["loading"]:
+            return
+        st["loading"].add(key)
+
+        def load():
+            try:
+                folder = os.path.join(DATA_DIR, "previews")
+                os.makedirs(folder, exist_ok=True)
+                path = os.path.join(folder, hashlib.sha1(key.encode()).hexdigest() + ".png")
+                if not os.path.exists(path):
+                    img = Image.open(io.BytesIO(http_get(key, 30))).convert("RGB")
+                    img.thumbnail((480, 270))
+                    img.save(path)
+                img = Image.open(path)
+                img.thumbnail((236, 133))
+                root.after(0, lambda: done(ImageTk.PhotoImage(img)))
+            except Exception:
+                st["loading"].discard(key)
+
+        def done(photo):
+            st["thumbs"][key] = photo
+            st["loading"].discard(key)
+            if label.winfo_exists():
+                label.configure(image=photo)
+        pool.submit(load)
+
+    def tile(parent, m, width):
+        on = m["id"] in st["sel"]
+        gear = None
+        t = tk.Frame(parent, bg=C["panel"], highlightthickness=2, highlightbackground=C["gold"] if on else C["line"], cursor="hand2")
+        if st["tab"] == "d2pfx":
+            pic = tk.Label(t, bg="#0f131a", width=236, height=133, text="" if m["preview"] else T("без превью", "no preview"), fg=C["muted"])
+            pic.pack(padx=8, pady=(8, 4))
+            thumb(m, pic)
+            top = tk.Frame(t, bg=C["panel"])
+            top.pack(fill="x", padx=10)
+            tk.Label(top, text=m["name"], bg=C["panel"], fg=C["fg"], font=(F, 10, "bold"), anchor="w", justify="left", wraplength=width - 50).pack(side="left", fill="x")
+            tk.Label(top, text="✓" if on else "", bg=C["panel"], fg=C["gold"], font=(F, 13, "bold")).pack(side="right")
+            tk.Label(t, text=T(f"автор: {m['author']}", f"author: {m['author']}") if m["author"] else "Dota2PornFx", bg=C["panel"], fg=C["muted"], font=(F, 8), anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+        else:
+            top = tk.Frame(t, bg=C["panel"])
+            top.pack(fill="x", padx=12, pady=(10, 2))
+            tk.Label(top, text=m.get("icon", "◆"), bg=C["panel"], fg=C["gold"], font=(F, 18)).pack(side="left")
+            tk.Label(top, text="✓" if on else "", bg=C["panel"], fg=C["gold"], font=(F, 14, "bold")).pack(side="right")
+            kind = {"fps": "FPS", "sound": T("звук", "sound"), "visual": T("вид", "visual")}.get(m.get("category"), "")
+            tk.Label(top, text=kind, bg=C["panel2"], fg=C["muted"], font=(F, 8, "bold"), padx=6).pack(side="right", padx=6)
+            tk.Label(t, text=loc(m["name"]), bg=C["panel"], fg=C["fg"], font=(F, 11, "bold"), anchor="w", justify="left", wraplength=width - 30).pack(fill="x", padx=12)
+            tk.Label(t, text=loc(m["desc"]), bg=C["panel"], fg=C["muted"], font=(F, 9), anchor="w", justify="left", wraplength=width - 30).pack(fill="x", padx=12, pady=(2, 6 if m.get("settings") else 12))
+            if m.get("settings") or m.get("paint"):
+                gear = tk.Label(t, text=T("⚙ Открыть редактор", "⚙ Open editor") if m.get("paint") else T("⚙ Настроить", "⚙ Settings"), bg=C["panel"], fg=C["gold"], font=(F, 9, "underline"), cursor="hand2")
+                gear.pack(anchor="w", padx=12, pady=(0, 10))
+
+        def toggle(_e=None):
+            if not st["busy"]:
+                if m["id"] not in st["sel"]:
+                    drop = []
+                    if m.get("cat") in SINGLE_CATS:  # one fog shader / terrain / font at a time
+                        drop.append(f"d2pfx:{m['cat']}/")
+                    drop += m.get("excludes", [])  # our mods that replace the same files as whole D2PFX categories
+                    clash = {o["id"] for o in st["catalog"]["mods"] if any(f"d2pfx:{m.get('cat')}/".startswith(x) for x in o.get("excludes", []))}
+                    st["sel"] = {i for i in st["sel"] if not any(i.startswith(x) for x in drop) and i not in clash}
+                st["sel"].symmetric_difference_update({m["id"]})
+                draw()
+
+        def bind_all(w):
+            w.bind("<Button-1>", toggle)
+            for c in w.winfo_children():
+                bind_all(c)
+        bind_all(t)
+        if gear is not None:  # after bind_all, so a click here opens the settings instead of ticking the tile
+            gear.bind("<Button-1>", lambda e: open_paint(m) if m.get("paint") else open_settings(m))
+        return t
+
+    hp_sheet = {}  # the health bar sprites from the player's own game, loaded once for the preview
+    tex_cache = {}  # the first texture of a recolour mod, for its preview
+
+    def hp_preview(m, factors):
+        """Creep bars at 60, 30 and 12% for both teams, drawn from the game's sprites with the chosen brightness."""
+        empty, full = hp_sheet["empty"], hp_sheet["full"]
+        k = 2
+        w, h = empty.size
+        rows = []
+        for col in ((255, 70, 55), (95, 230, 90)):  # roughly the enemy and ally tints
+            for hp in (0.6, 0.3, 0.12):
+                bar = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                for part, key, cut in ((empty, "tintable_creep_empty", w), (full, "tintable_creep_full", int(w * hp))):
+                    f = factors.get(key, 1)
+                    rgb = part.convert("RGB").point(lambda v, f=f: min(255, int(v * f)))
+                    rgb = ImageChops.multiply(rgb, Image.new("RGB", part.size, col))
+                    bar.alpha_composite(Image.merge("RGBA", (*rgb.split(), part.getchannel("A"))).crop((0, 0, cut, h)))
+                rows.append(bar.resize((w * k, h * k), Image.NEAREST))
+        out = Image.new("RGB", (w * k + 24, len(rows) * (h * k + 10) + 14), (58, 72, 44))
+        for i, r in enumerate(rows):
+            out.paste(r, (12, 12 + i * (h * k + 10)), r)
+        return ImageTk.PhotoImage(out)
+
+    def open_paint(m):
+        """A small window: open the 3D editor inside the app, paste a code from the site, or clear the colours."""
+        win = tk.Toplevel(root)
+        win.title(loc(m["name"]))
+        win.configure(bg=C["bg"])
+        win.transient(root)
+        win.resizable(False, False)
+        info = tk.StringVar()
+
+        def refresh():
+            n = len(((load_settings().get(PAINT_ID) or {}).get("t") or {}))
+            info.set(T(f"Сохранено изменённых текстур: {n}.", f"Saved textures: {n}.") + (T(" Нажми «Установить выбранные», чтобы поставить их в игру.", " Press Install selected to put them in the game.") if n else ""))
+        tk.Label(win, text=T("Настрой цвета героев в 3D-редакторе: клик по части модели, выбор цвета, галочка «Красить всего героя». Видишь цвета только ты.", "Set hero colours in the 3D editor: click a part of the model, pick a colour, or tick Paint the whole hero. Only you see the colours."),
+                 bg=C["bg"], fg=C["fg"], font=(F, 10), wraplength=440, justify="left").pack(padx=16, pady=(16, 8), anchor="w")
+        tk.Label(win, textvariable=info, bg=C["bg"], fg=C["gold"], font=(F, 9), wraplength=440, justify="left").pack(padx=16, anchor="w")
+        bar = tk.Frame(win, bg=C["bg"])
+        bar.pack(fill="x", padx=16, pady=14)
+
+        def after_editor():
+            refresh()
+            if (load_settings().get(PAINT_ID) or {}).get("t"):
+                st["sel"].add(PAINT_ID)
+                draw()
+                status.set(T("Кастомизация сохранена. Нажми «Установить выбранные», чтобы поставить её в игру.", "Customisation saved. Press Install selected to put it in the game."))
+
+        def editor():
+            frozen = getattr(sys, "frozen", False)
+            cmd = [sys.executable, "--paint"] if frozen else [sys.executable, os.path.abspath(__file__), "--paint"]
+            try:
+                proc = subprocess.Popen(cmd)
+            except OSError:
+                webbrowser.open(site_url("#paint"))
+                return
+            def wait():
+                code = proc.wait()
+                if code:  # no WebView2 or pywebview: the same editor in the browser, colours come back as a code
+                    root.after(0, lambda: (webbrowser.open(site_url("#paint")), info.set(T("Редактор открыт в браузере. Там нажми «Скопировать код», потом здесь «Вставить код».", "The editor opened in the browser. Press Copy the code there, then Paste code here."))))
+                root.after(0, after_editor)
+            threading.Thread(target=wait, daemon=True).start()
+
+        def paste():
+            try:
+                n = save_paint(root.clipboard_get())
+                after_editor()
+                messagebox.showinfo("D2A Mods", T(f"Код принят: {n} текстур.", f"Code accepted: {n} textures."), parent=win)
+            except Exception as e:
+                messagebox.showerror("D2A Mods", T(f"Не получилось прочитать код: {e}", f"Could not read the code: {e}"), parent=win)
+
+        def clear():
+            s = load_settings()
+            s.pop(PAINT_ID, None)
+            save_settings(s)
+            st["sel"].discard(PAINT_ID)
+            draw()
+            refresh()
+        button(bar, T("Открыть 3D-редактор", "Open the 3D editor"), editor, primary=True).pack(side="left")
+        button(bar, T("Вставить код", "Paste code"), paste).pack(side="left", padx=8)
+        button(bar, T("Очистить", "Clear"), clear).pack(side="left")
+        refresh()
+
+    def open_settings(m):
+        win = tk.Toplevel(root)
+        win.title(loc(m["name"]))
+        win.configure(bg=C["bg"])
+        win.transient(root)
+        win.resizable(False, False)
+        own = load_settings().get(m["id"], {})
+        pic = tk.Label(win, bg=C["bg"], fg=C["muted"], text=T("Загружаю текстуры из игры…", "Loading textures from the game…"), font=(F, 9))
+        pic.pack(padx=16, pady=(16, 8))
+        sliders = {}
+
+        mult = {s["key"]: s.get("mult", 100) for s in m["settings"]}
+
+        def factors():
+            return {k: v.get() / mult[k] for k, v in sliders.items()}
+
+        def redraw(_=None):
+            if Image is None:
+                return
+            if m.get("sheet") and hp_sheet:
+                pic.photo = hp_preview(m, factors())
+            elif m.get("recolor") and m["id"] in tex_cache:
+                raw, fmt = tex_cache[m["id"]]
+                data = bytearray(raw)
+                colorize(data, factors().get("hue", m["recolor"]["hue"]), m["recolor"].get("sat", 1.0), m["recolor"].get("hues"))
+                off, size = resource_block(data, "DATA")
+                w, h = struct.unpack_from("<HH", data, off + 20)
+                bs = 8 if fmt == 1 else 16
+                mip = lambda k: max(1, (max(1, w >> k) + 3) // 4) * max(1, (max(1, h >> k) + 3) // 4) * bs
+                start = off + size + sum(mip(k) for k in range(1, data[off + 27]))  # the full size image is stored last
+                img = Image.frombytes("RGBA", (w, h), bytes(data[start:start + mip(0)]), "bcn", 1 if fmt == 1 else 3).convert("RGB")
+                pic.photo = ImageTk.PhotoImage(img.resize((320, 320)))
+            else:
+                return
+            pic.configure(image=pic.photo, text="")
+
+        for s in m["settings"]:
+            row = tk.Frame(win, bg=C["bg"])
+            row.pack(fill="x", padx=16, pady=2)
+            tk.Label(row, text=loc(s), bg=C["bg"], fg=C["fg"], font=(F, 10), width=16, anchor="w").pack(side="left")
+            k = s.get("mult", 100)
+            v = tk.DoubleVar(value=round(float(own.get(s["key"], s["default"])) * k))
+            tk.Scale(row, from_=s["min"] * k, to=s["max"] * k, resolution=s.get("step", 5), orient="horizontal", variable=v, length=300, command=redraw,
+                     bg=C["bg"], fg=C["fg"], troughcolor=C["panel2"], highlightthickness=0, activebackground=C["gold"]).pack(side="left")
+            tk.Label(row, text=s.get("unit", "%"), bg=C["bg"], fg=C["muted"], font=(F, 9)).pack(side="left")
+            sliders[s["key"]] = v
+        if m.get("note"):
+            tk.Label(win, text=loc(m["note"]), bg=C["bg"], fg=C["muted"], font=(F, 9), wraplength=440, justify="left").pack(padx=16, pady=(6, 0), anchor="w")
+        bar = tk.Frame(win, bg=C["bg"])
+        bar.pack(fill="x", padx=16, pady=14)
+
+        def save():
+            all_ = load_settings()
+            all_[m["id"]] = factors()
+            save_settings(all_)
+            st["sel"].add(m["id"])
+            draw()
+            status.set(T("Настройки сохранены. Нажми «Установить выбранные», чтобы применить их в игре.", "Settings saved. Press Install selected to apply them in the game."))
+            win.destroy()
+
+        def defaults():
+            for s in m["settings"]:
+                sliders[s["key"]].set(round(s["default"] * s.get("mult", 100)))
+            redraw()
+        button(bar, T("Сохранить", "Save"), save, primary=True).pack(side="left")
+        button(bar, T("По умолчанию", "Defaults"), defaults).pack(side="left", padx=8)
+
+        def load_tex():
+            try:
+                data = vpk.open(os.path.join(st["game"], "dota", "pak01_dir.vpk")).get_file(m["recolor"]["textures"][0]).read()
+                off, _ = resource_block(data, "DATA")
+                tex_cache[m["id"]] = (data, data[off + 26])
+                root.after(0, redraw)
+            except Exception:
+                root.after(0, lambda: pic.configure(text=T("Превью недоступно, но настройки работают", "No preview, but the settings work")))
+
+        def load():
+            try:
+                pak = vpk.open(os.path.join(st["game"], "dota", "pak01_dir.vpk"))
+                data = pak.get_file(m["sheet"]["texture"] + ".vtex_c").read()
+                off, size = resource_block(data, "DATA")
+                w, h = struct.unpack_from("<HH", data, off + 20)
+                sheet = Image.frombytes("RGBA", (w, h), data[off + size:off + size + w * h], "bcn", 3)
+                uv = sheet_sprites(data)
+                crop = lambda n: sheet.crop(tuple(round(c * s) for c, s in zip(uv[n], (w, h, w, h))))
+                hp_sheet.update(empty=crop("tintable_creep_empty"), full=crop("tintable_creep_full"))
+                root.after(0, redraw)
+            except Exception:
+                root.after(0, lambda: pic.configure(text=T("Превью недоступно, но настройки работают", "No preview, but the settings work")))
+        if (m.get("sheet") and hp_sheet) or m["id"] in tex_cache:
+            redraw()
+        elif Image is not None and st["game"]:
+            threading.Thread(target=load_tex if m.get("recolor") else load, daemon=True).start()
+
+    def draw():
+        for w in grid.winfo_children():
+            w.destroy()
+        if not st["catalog"]:
+            return
+        width = max(300, canvas.winfo_width())
+        cols = max(1, width // (262 if st["tab"] == "d2pfx" else 290))
+        st["cols"] = cols
+        tw = width // cols - 12
+        its = view_items()
+        for i, m in enumerate(its):
+            tile(grid, m, tw).grid(row=i // cols, column=i % cols, padx=6, pady=6, sticky="nsew")
+        if st["tab"] == "d2pfx" and not its:
+            tk.Label(grid, text=T("Загружаю каталог D2PFX…", "Loading the D2PFX catalog…") if st["d2pfx"] is None else T("Ничего не нашлось", "Nothing found"), bg=C["bg"], fg=C["muted"], font=(F, 10)).grid(row=0, column=0, sticky="w", padx=6, pady=10)
+        for c in range(cols):
+            grid.grid_columnconfigure(c, weight=1, minsize=tw)
+        canvas.itemconfigure(win, width=width)
+        for b in tabs_row.winfo_children():
+            on = b.tab_id == st["tab"]
+            b.configure(bg=C["panel2"] if on else C["bg"], fg=C["gold"] if on else C["muted"])
+        for b in cats_row.winfo_children():
+            on = b.cat_id == st["cat"]
+            b.configure(bg=C["panel2"] if on else C["bg"], fg=C["gold"] if on else C["muted"])
+        n_ext = sum(1 for i in st["sel"] if i.startswith("d2pfx:"))
+        count_var.set(T(f"выбрано: {len(st['sel'])}", f"selected: {len(st['sel'])}") + (T(f" (из D2PFX: {n_ext})", f" (D2PFX: {n_ext})") if n_ext else "") if st["sel"] else "")
+
+    job = {"id": None}
+
+    def redraw_soon(delay=150):
+        if job["id"]:
+            root.after_cancel(job["id"])
+        job["id"] = root.after(delay, draw)
+
+    def on_resize(e):
+        canvas.itemconfigure(win, width=e.width)
+        if st["catalog"] and max(1, max(300, e.width) // (262 if st["tab"] == "d2pfx" else 290)) != st["cols"]:
+            redraw_soon()
+    canvas.bind("<Configure>", on_resize)
+    qvar.trace_add("write", lambda *a: (st.update(query=qvar.get()), redraw_soon(250)))
+
+    def set_tab(tab):
+        st["tab"] = tab
+        if tab == "d2pfx":
+            sub.pack(fill="x", padx=20, pady=(0, 6), after=tabs_row)
+            if st["d2pfx"] is None:
+                status.set(T("Загружаю каталог D2PFX…", "Loading the D2PFX catalog…"))
+
+                def load():
+                    try:
+                        data = load_d2pfx()
+                        root.after(0, lambda: (st.update(d2pfx=data), status.set(T(f"Каталог D2PFX: {sum(map(len, data.values()))} модов. Скачаются только отмеченные.", f"D2PFX catalog: {sum(map(len, data.values()))} mods. Only the ticked ones are downloaded.")), draw()))
+                    except Exception:
+                        root.after(0, lambda: status.set(T("Не удалось загрузить каталог D2PFX. Проверь интернет.", "Could not load the D2PFX catalog. Check the internet connection.")))
+                threading.Thread(target=load, daemon=True).start()
+        else:
+            sub.pack_forget()
+        canvas.yview_moveto(0)
+        draw()
+
+    def set_cat(cat):
+        st["cat"] = cat
+        if cat == "terrains":
+            status.set(T("Ландшафты меняют стандартную карту: если в Dota выбран другой ландшафт, верни стандартный.", "Terrains change the default map: if another terrain is equipped in Dota, switch back to the default one."))
+        elif cat == "fonts":
+            status.set(T("Шрифт заменяет файлы шрифтов игры, оригиналы сохраняются. Не во всех шрифтах есть кириллица.", "A font replaces the game font files, the originals are kept. Not every font has Cyrillic."))
+        canvas.yview_moveto(0)
+        draw()
+
+    def select_view(on):
+        if on and st["tab"] == "d2pfx" and st["cat"] in SINGLE_CATS:
+            return status.set(T("В этой категории можно выбрать только один мод: они меняют одни и те же файлы.", "Only one mod in this category: they change the same files."))
+        ids = {m["id"] for m in view_items()}
+        st["sel"] = (st["sel"] | ids) if on else (st["sel"] - ids)
+        draw()
+
+    def switch_lang():
+        global LANG
+        LANG = "en" if LANG == "ru" else "ru"
+        all_ = load_settings()
+        all_["lang"] = LANG
+        save_settings(all_)
+        st["restart"] = True
+        root.destroy()
+
+    def pick():
+        d = filedialog.askdirectory(title=T("Папка ...\\dota 2 beta\\game", "Folder ...\\dota 2 beta\\game"))
+        if d and os.path.exists(os.path.join(d, "dota", "gameinfo.gi")):
+            st["game"] = os.path.normpath(d)
+            path_var.set(st["game"])
+            refresh_status()
+        elif d:
+            messagebox.showerror("D2A Mods", T("Нужна папка ...\\steamapps\\common\\dota 2 beta\\game", "Pick the folder ...\\steamapps\\common\\dota 2 beta\\game"))
+
+    def refresh_status():
+        if not st["game"]:
+            return status.set(T("Не нашёл Dota 2. Нажми «Папка игры» и укажи ...\\steamapps\\common\\dota 2 beta\\game", "Dota 2 not found. Press Game folder and pick ...\\steamapps\\common\\dota 2 beta\\game"))
+        have = installed_ids(st["game"])
+        method, folder = target(st["game"])
+        where = T(f"моды встанут в папку {os.path.basename(folder)}", f"mods go into the {os.path.basename(folder)} folder") if method == "lang" else T("английский клиент: надёжнее поставить -language dutch и включить «Английский интерфейс»", "English client: setting -language dutch and the English interface tile is more reliable")
+        rec = load_state().get(st["game"]) or {}
+        if have and rec.get("folder") and os.path.normcase(rec["folder"]) != os.path.normcase(folder):
+            status.set(T(f"Dota сейчас читает папку {os.path.basename(folder)} (язык или параметр -language поменялся). Нажми «Установить выбранные», чтобы перенести моды туда.", f"Dota now reads the {os.path.basename(folder)} folder (the language or -language changed). Press Install selected to move the mods there."))
+        elif have and needs_reapply(st["game"]):
+            status.set(T("Dota обновилась и отключила моды. Нажми «Установить выбранные», чтобы вернуть их.", "Dota updated and switched the mods off. Press Install selected to bring them back."))
+        elif have:
+            status.set(T(f"Установлено: {len(have)}. Поменяй галочки и нажми «Установить», чтобы обновить набор ({where}).", f"Installed: {len(have)}. Change the ticks and press Install to update the set ({where})."))
+        else:
+            status.set(T(f"Отметь моды и нажми «Установить выбранные». Перед установкой закрой Dota ({where}).", f"Tick the mods and press Install selected. Close Dota first ({where})."))
+
+    def work(fn):
+        st["busy"] = True
+        root.configure(cursor="watch")
+
+        def run():
+            try:
+                msg = fn()
+                root.after(0, status.set, msg)
+            except Exception as e:
+                err = str(e)
+                root.after(0, lambda: messagebox.showerror("D2A Mods", err))
+            finally:
+                def done():
+                    st["busy"] = False
+                    root.configure(cursor="")
+                    draw()
+                root.after(0, done)
+        threading.Thread(target=run, daemon=True).start()
+
+    def do_install():
+        if not st["game"]:
+            return messagebox.showerror("D2A Mods", T("Сначала укажи папку игры", "Pick the game folder first"))
+        if not st["sel"]:
+            return do_uninstall()
+        if any(i.startswith("d2pfx:") for i in st["sel"]) and st["d2pfx"] is None:
+            st["d2pfx"] = load_d2pfx()
+        status.set(T("Собираю моды… Это может занять до минуты.", "Building the mods… This can take up to a minute."))
+        work(lambda: (lambda n: T(f"Готово: файлов в модах — {n}. Запускай Dota.", f"Done: {n} files in the mods. Start Dota."))(install(st['game'], st['catalog'], st['d2pfx'], set(st['sel']), lambda s: root.after(0, status.set, s))))
+
+    def do_uninstall():
+        if st["game"] and messagebox.askyesno("D2A Mods", T("Удалить все наши моды и вернуть игру как было?", "Remove all our mods and put the game back as it was?")):
+            def run():
+                uninstall(st["game"])
+                st["sel"] = set()
+                return T("Все моды удалены, игра как была.", "All mods removed, the game is as it was.")
+            work(run)
+
+    try:
+        st["catalog"], offline = load_catalog()
+    except Exception:
+        status.set(T("Не удалось загрузить список модов. Проверь интернет и перезапусти программу.", "Could not load the mod list. Check the internet connection and restart the app."))
+        root.mainloop()
+        return
+    tabs = (st["catalog"].get("tabs") or [{"id": "optimize", "name": {"ru": "Оптимизация", "en": "Optimisation"}}]) + [{"id": "d2pfx", "name": {"ru": "Каталог D2PFX", "en": "D2PFX catalog"}}]
+    for t in tabs:
+        b = tk.Label(tabs_row, text=loc(t["name"]), bg=C["bg"], fg=C["muted"], font=(F, 11, "bold"), padx=16, pady=7, cursor="hand2")
+        b.tab_id = t["id"]
+        b.bind("<Button-1>", lambda e, tid=t["id"]: set_tab(tid))
+        b.pack(side="left", padx=(0, 6))
+    for cid, ru_label, en_label in D2PFX_CATS:
+        b = tk.Label(cats_row, text=T(ru_label, en_label), bg=C["bg"], fg=C["muted"], font=(F, 9, "bold"), padx=10, pady=5, cursor="hand2")
+        b.cat_id = cid
+        b.bind("<Button-1>", lambda e, c=cid: set_cat(c))
+        b.pack(side="left", padx=(0, 4))
+    st["tab"] = tabs[0]["id"]
+    if st["game"]:
+        st["sel"] = installed_ids(st["game"])
+    refresh_status()
+    newest = st["catalog"].get("app", {}).get("version")
+    if offline:
+        status.set(T("Нет интернета: показан сохранённый список модов.", "No internet: showing the saved mod list."))
+    elif newest and ver(newest) > ver(APP_VERSION):
+        status.set(T(f"Есть новая версия программы {newest}: скачай её на сайте (кнопка «Сайт»).", f"A new version {newest} is out: download it on the website (Website button)."))
+        download = st["catalog"].get("app", {}).get("download")
+
+        def offer():
+            if download and messagebox.askyesno("D2A Mods", T(f"Вышла новая версия {newest} (у тебя {APP_VERSION}). Скачать сейчас?\n\nПосле скачивания закрой эту программу и запусти новую.", f"Version {newest} is out (you have {APP_VERSION}). Download it now?\n\nAfter downloading, close this app and start the new one.")):
+                webbrowser.open(download)
+        root.after(400, offer)
+    root.after(50, draw)
+    root.mainloop()
+    pool.shutdown(wait=False, cancel_futures=True)
+    return st.get("restart")
+
+
+def main():
+    global LANG
+    LANG = load_settings().get("lang") or system_lang()
+    args = sys.argv[1:]
+    if "--paint" in args:
+        try:
+            paint_window()
+        except Exception:
+            sys.exit(2)  # the app falls back to the browser
+        return
+    if "--build-only" in args:
+        out = args[args.index("--build-only") + 1]
+        game = args[args.index("--game") + 1] if "--game" in args else find_dota()
+        if "--catalog" in args:
+            with open(args[args.index("--catalog") + 1], encoding="utf-8") as f:
+                catalog = json.load(f)
+        else:
+            catalog = load_catalog()[0]
+        ids = set(args[args.index("--mods") + 1].split(",")) if "--mods" in args else {m["id"] for m in catalog["mods"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            n = build_rules(game, catalog, ids, tmp)
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            vpk.new(tmp).save(out)
+        print(f"game: {game}\nfiles replaced: {n} -> {out}")
+        return
+    while run_gui():  # a language switch rebuilds the window
+        pass
+
+
+if __name__ == "__main__":
+    main()
